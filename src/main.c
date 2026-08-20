@@ -5,41 +5,43 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 
+
 #include "token.h"
 #include "lexer.h"
+#include "parser.h"
+#include "expand.h"
+#include "builtin.h"
+#include "executor.h"
 
 int main(void)
 {
     char *line;
 
     printf("=====================================\n");
-    printf("Shellforge \n");
+    printf("Shellforge\n");
     printf(" A Unix Style Shell written in C\n");
     printf("=====================================\n");
 
     while (1)
     {
-        /* Read input from ShellForge */
+        token_list_t tokens;
+        pipeline_t pipeline;
+
         line = readline("shellforge$ ");
 
-        /* Ctrl + D */
         if (line == NULL)
         {
             printf("\nGoodbye!\n");
             break;
         }
 
-        /* Ignore empty input */
         if (strlen(line) == 0)
         {
             free(line);
             continue;
         }
 
-        /*
-         * IMPORTANT:
-         * This keeps the UP and DOWN arrow history working.
-         */
+        /* Store command for UP arrow and history */
         add_history(line);
 
         /* Exit */
@@ -50,51 +52,47 @@ int main(void)
             break;
         }
 
-        /*
-         * HISTORY COMMAND
-         */
-        if (strcmp(line, "history") == 0)
+        /* Lexer */
+        if (!lexer(line, &tokens))
         {
-            HIST_ENTRY **entries;
-            int i = 0;
-
-            entries = history_list();
-
-            if (entries != NULL)
-            {
-                while (entries[i] != NULL)
-                {
-                    printf("%d  %s\n",
-                           i + 1,
-                           entries[i]->line);
-                    i++;
-                }
-            }
-
+            printf("Lexer failed.\n");
             free(line);
             continue;
         }
 
-        /*
-         * LEXER / TOKENIZER
-         */
-        token_list_t tokens;
+        /* Display tokens */
+        token_print(&tokens);
 
-        if (lexer(line, &tokens))
+        /* Parser */
+        if (!parse(&tokens, &pipeline))
         {
-            token_print(&tokens);
-        }
-        else
-        {
-            printf("Lexer failed.\n");
+            free(line);
+            continue;
         }
 
-        /*
-         * YOUR PREVIOUS OUTPUT
-         */
-        printf(" YOU ENTERED : %s\n", line);
+        /* Variable expansion */
+        expand_variables(&pipeline);
 
+        /* Display parsed pipeline */
+pipeline_print(&pipeline);
+
+/* Execute commands */
+for (int i = 0; i < pipeline.command_count; i++)
+{
+    int result = execute_command(&pipeline.commands[i]);
+
+    if (result == 1)
+    {
+        pipeline_free(&pipeline);
         free(line);
+        return 0;
+    }
+}
+
+/* Free pipeline after execution */
+pipeline_free(&pipeline);
+
+free(line);
     }
 
     return 0;
