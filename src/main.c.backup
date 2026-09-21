@@ -76,17 +76,20 @@ int main(void)
         /* Display parsed pipeline */
 pipeline_print(&pipeline);
 
-        /* Execute pipeline */
-        int result = execute_pipeline(&pipeline);
+/* Execute commands */
+for (int i = 0; i < pipeline.command_count; i++)
+{
+    int result = execute_command(&pipeline.commands[i]);
 
-        if (result == 1)
-        {
-            pipeline_free(&pipeline);
-            free(line);
-            return 0;
-        }
+    if (result == 1)
+    {
+        pipeline_free(&pipeline);
+        free(line);
+        return 0;
+    }
+}
 
-        /* Free pipeline after execution */
+/* Free pipeline after execution */
 pipeline_free(&pipeline);
 
 free(line);
