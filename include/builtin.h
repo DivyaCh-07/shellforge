@@ -6,4 +6,6 @@
 int is_builtin(const command_t *cmd);
 int execute_builtin(command_t *cmd);
 
+int is_job_builtin(const command_t *cmd);
+
 #endif

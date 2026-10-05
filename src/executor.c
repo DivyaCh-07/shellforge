@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -7,50 +8,161 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <errno.h>
+#include <string.h>
 
 #include "executor.h"
 #include "builtin.h"
+#include "job.h"
+#include "jobcontroller.h"
 
 
-/* Reap completed background processes */
-static void reap_background_processes(int sig)
+/* ---------------------------------------------------------
+   Terminal control
+   --------------------------------------------------------- */
+
+static void give_terminal_to(pid_t pgid)
 {
-    int saved_errno = errno;
-    int status;
-
-    (void)sig;
-
-    while (waitpid(-1, &status, WNOHANG) > 0)
+    if (tcsetpgrp(STDIN_FILENO, pgid) == -1)
     {
-        /* Child has been collected */
+        perror("tcsetpgrp");
     }
-
-    errno = saved_errno;
 }
 
 
-/* Install SIGCHLD handler */
-static void setup_sigchld(void)
+static void take_terminal_back(void)
 {
-    struct sigaction sa;
+    pid_t shell_pgid = getpgrp();
 
-    sa.sa_handler = reap_background_processes;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-
-    sigaction(SIGCHLD, &sa, NULL);
+    if (tcsetpgrp(STDIN_FILENO, shell_pgid) == -1)
+    {
+        perror("tcsetpgrp");
+    }
 }
 
+
+/* ---------------------------------------------------------
+   Restore default signals in child
+   --------------------------------------------------------- */
+
+static void restore_child_signals(void)
+{
+    signal(SIGINT, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+    signal(SIGTTIN, SIG_DFL);
+    signal(SIGTTOU, SIG_DFL);
+}
+
+
+/* ---------------------------------------------------------
+   Build command string
+   --------------------------------------------------------- */
+
+static void build_command_string(command_t *cmd,
+                                 char *buffer,
+                                 size_t size)
+{
+    size_t i;
+    size_t used = 0;
+
+    buffer[0] = '\0';
+
+    for (i = 0; i < (size_t)cmd->argc; i++)
+    {
+        size_t length;
+
+        if (cmd->argv[i] == NULL)
+            continue;
+
+        length = strlen(cmd->argv[i]);
+
+        if (i > 0)
+        {
+            if (used + 1 >= size)
+                break;
+
+            buffer[used++] = ' ';
+            buffer[used] = '\0';
+        }
+
+        if (used + length >= size)
+            break;
+
+        strcpy(buffer + used, cmd->argv[i]);
+        used += length;
+    }
+}
+
+
+/* ---------------------------------------------------------
+   Build pipeline string
+   --------------------------------------------------------- */
+
+static void build_pipeline_string(pipeline_t *pipeline,
+                                   char *buffer,
+                                   size_t size)
+{
+    size_t i;
+    size_t used = 0;
+
+    buffer[0] = '\0';
+
+    for (i = 0; i < (size_t)pipeline->command_count; i++)
+    {
+        char command_text[MAX_JOB_COMMAND];
+        size_t length;
+
+        build_command_string(&pipeline->commands[i],
+                              command_text,
+                              sizeof(command_text));
+
+        length = strlen(command_text);
+
+        if (i > 0)
+        {
+            if (used + 3 >= size)
+                break;
+
+            strcpy(buffer + used, " | ");
+            used += 3;
+        }
+
+        if (used + length >= size)
+            break;
+
+        strcpy(buffer + used, command_text);
+        used += length;
+    }
+}
+
+
+/* ---------------------------------------------------------
+   Execute single command
+   --------------------------------------------------------- */
 
 int execute_command(command_t *cmd)
 {
     pid_t pid;
     int status;
+    int background;
+    char command_text[MAX_JOB_COMMAND];
 
     if (cmd == NULL || cmd->argc == 0)
-        return -1;
+        return 0;
 
-    setup_sigchld();
+    /*
+     * jobs, fg and bg must execute in the shell process.
+     */
+    if (is_job_builtin(cmd))
+    {
+        return execute_builtin(cmd);
+    }
+
+    background = cmd->background;
+
+    build_command_string(cmd,
+                         command_text,
+                         sizeof(command_text));
 
     pid = fork();
 
@@ -60,38 +172,36 @@ int execute_command(command_t *cmd)
         return -1;
     }
 
-    /* Child */
+
+    /* -----------------------------------------------------
+       Child
+       ----------------------------------------------------- */
+
     if (pid == 0)
     {
-        char *args[MAX_ARGS + 1];
-        int i;
         int fd;
 
-        for (i = 0; i < cmd->argc; i++)
-            args[i] = cmd->argv[i];
+        restore_child_signals();
 
-        args[cmd->argc] = NULL;
+        /*
+         * Child becomes leader of its own process group.
+         */
+        if (setpgid(0, 0) == -1)
+        {
+            perror("setpgid");
+            exit(EXIT_FAILURE);
+        }
 
-        /* Background commands should not read from terminal */
-        if (cmd->background && cmd->input[0] == '\0')
+        /*
+         * Background process gets /dev/null as stdin.
+         */
+        if (background)
         {
             fd = open("/dev/null", O_RDONLY);
 
-            if (fd >= 0)
-            {
-                dup2(fd, STDIN_FILENO);
-                close(fd);
-            }
-        }
-
-        /* Input redirection */
-        if (cmd->input[0] != '\0')
-        {
-            fd = open(cmd->input, O_RDONLY);
-
             if (fd < 0)
             {
-                perror("input");
+                perror("/dev/null");
                 exit(EXIT_FAILURE);
             }
 
@@ -99,25 +209,42 @@ int execute_command(command_t *cmd)
             close(fd);
         }
 
-        /* Output redirection */
-        if (cmd->output[0] != '\0')
+        /*
+         * Input redirection.
+         */
+        if (cmd->input[0] != '\0')
         {
-            if (cmd->append)
-            {
-                fd = open(cmd->output,
-                          O_WRONLY | O_CREAT | O_APPEND,
-                          0644);
-            }
-            else
-            {
-                fd = open(cmd->output,
-                          O_WRONLY | O_CREAT | O_TRUNC,
-                          0644);
-            }
+            fd = open(cmd->input, O_RDONLY);
 
             if (fd < 0)
             {
-                perror("output");
+                perror("open input");
+                exit(EXIT_FAILURE);
+            }
+
+            dup2(fd, STDIN_FILENO);
+            close(fd);
+        }
+
+        /*
+         * Output redirection.
+         */
+        if (cmd->output[0] != '\0')
+        {
+            int flags = O_WRONLY | O_CREAT;
+
+            if (cmd->append)
+                flags |= O_APPEND;
+            else
+                flags |= O_TRUNC;
+
+            fd = open(cmd->output,
+                      flags,
+                      0644);
+
+            if (fd < 0)
+            {
+                perror("open output");
                 exit(EXIT_FAILURE);
             }
 
@@ -125,68 +252,207 @@ int execute_command(command_t *cmd)
             close(fd);
         }
 
-        /* Builtin */
+        /*
+         * Builtin.
+         */
         if (is_builtin(cmd))
         {
-            int result = execute_builtin(cmd);
-            exit(result);
+            exit(execute_builtin(cmd));
         }
 
-        execvp(args[0], args);
+        /*
+         * External command.
+         */
+        execvp(cmd->argv[0], cmd->argv);
 
-        perror("Shellforge");
+        perror(cmd->argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    /* Background command */
-    if (cmd->background)
+
+    /* -----------------------------------------------------
+       Parent
+       ----------------------------------------------------- */
+
+    /*
+     * Parent also puts child into its own process group.
+     */
+    if (setpgid(pid, pid) == -1)
     {
-        printf("[Background PID: %d]\n", pid);
+        if (errno != EACCES && errno != ESRCH)
+        {
+            perror("setpgid");
+        }
+    }
+
+
+    /* -----------------------------------------------------
+       Background command
+       ----------------------------------------------------- */
+
+    if (background)
+    {
+        int job_id;
+
+        job_id = job_add(pid,
+                         command_text,
+                         JOB_RUNNING);
+
+        if (job_id > 0)
+        {
+            printf("[%d] Running %s\n",
+                   job_id,
+                   command_text);
+        }
+
         return 0;
     }
 
-    /* Foreground command */
-    if (waitpid(pid, &status, 0) == -1)
-    {
-        if (errno == EINTR)
-            return 0;
 
-        perror("waitpid");
-        return -1;
+    /* -----------------------------------------------------
+       Foreground command
+       ----------------------------------------------------- */
+
+    give_terminal_to(pid);
+
+    while (1)
+    {
+        pid_t result;
+
+        result = waitpid(pid,
+                         &status,
+                         WUNTRACED);
+
+        if (result == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            perror("waitpid");
+            take_terminal_back();
+            return -1;
+        }
+
+        break;
     }
 
+
+    /* -----------------------------------------------------
+       Process stopped
+       ----------------------------------------------------- */
+
+    if (WIFSTOPPED(status))
+    {
+        int job_id;
+
+        job_id = job_add(pid,
+                         command_text,
+                         JOB_STOPPED);
+
+        if (job_id > 0)
+        {
+            printf("\n[%d] Stopped %s\n",
+                   job_id,
+                   command_text);
+        }
+
+        take_terminal_back();
+
+        return 0;
+    }
+
+
+    /* -----------------------------------------------------
+       Process exited
+       ----------------------------------------------------- */
+
     if (WIFEXITED(status))
-        return WEXITSTATUS(status);
+    {
+        int result = WEXITSTATUS(status);
+
+        take_terminal_back();
+
+        return result;
+    }
+
+
+    /* -----------------------------------------------------
+       Process killed by signal
+       ----------------------------------------------------- */
 
     if (WIFSIGNALED(status))
     {
-        fprintf(stderr,
-                "Process terminated by signal %d\n",
-                WTERMSIG(status));
+        take_terminal_back();
+
+        if (WTERMSIG(status) != SIGINT &&
+            WTERMSIG(status) != SIGQUIT)
+        {
+            fprintf(stderr,
+                    "Process terminated by signal %d\n",
+                    WTERMSIG(status));
+        }
 
         return -1;
     }
+
+    take_terminal_back();
 
     return 0;
 }
 
 
+/* ---------------------------------------------------------
+   Execute pipeline
+   --------------------------------------------------------- */
+
 int execute_pipeline(pipeline_t *pipeline)
 {
+
     int pipes[MAX_COMMANDS - 1][2];
-    pid_t pids[MAX_COMMANDS];
+    
+
+    pid_t pgid = 0;
 
     int i;
-    int j;
     int status;
+    int background;
 
-    if (pipeline == NULL || pipeline->command_count == 0)
-        return -1;
+    char command_text[MAX_JOB_COMMAND];
 
-    setup_sigchld();
+    if (pipeline == NULL ||
+        pipeline->command_count == 0)
+    {
+        return 0;
+    }
+  /*
+     * jobs, fg and bg must execute in the shell process.
+     */
+    if (pipeline->command_count == 1)
+    {
+        command_t *cmd = &pipeline->commands[0];
 
-    /* Create pipes */
-    for (i = 0; i < pipeline->command_count - 1; i++)
+        if (is_job_builtin(cmd))
+        {
+            return execute_builtin(cmd);
+        }
+    }
+    background =
+        pipeline->commands[
+            pipeline->command_count - 1
+        ].background;
+
+    build_pipeline_string(pipeline,
+                           command_text,
+                           sizeof(command_text));
+
+
+    /* -----------------------------------------------------
+       Create pipes
+       ----------------------------------------------------- */
+
+    for (i = 0;
+         i < pipeline->command_count - 1;
+         i++)
     {
         if (pipe(pipes[i]) == -1)
         {
@@ -195,76 +461,140 @@ int execute_pipeline(pipeline_t *pipeline)
         }
     }
 
-    /* Create children */
-    for (i = 0; i < pipeline->command_count; i++)
-    {
-        pids[i] = fork();
 
-        if (pids[i] < 0)
+    /* -----------------------------------------------------
+       Create processes
+       ----------------------------------------------------- */
+
+    for (i = 0;
+         i < pipeline->command_count;
+         i++)
+    {
+        pid_t pid;
+
+        pid = fork();
+
+        if (pid < 0)
         {
             perror("fork");
             return -1;
         }
 
-        /* Child */
-        if (pids[i] == 0)
-        {
-            char *args[MAX_ARGS + 1];
 
-            for (j = 0;
-                 j < pipeline->commands[i].argc;
-                 j++)
+        /* -------------------------------------------------
+           Child
+           ------------------------------------------------- */
+
+        if (pid == 0)
+        {
+            int fd;
+            int j;
+
+            restore_child_signals();
+
+            /*
+             * First process creates process group.
+             */
+            if (i == 0)
             {
-                args[j] = pipeline->commands[i].argv[j];
+                if (setpgid(0, 0) == -1)
+                {
+                    perror("setpgid");
+                    exit(EXIT_FAILURE);
+                }
+            }
+            else
+            {
+                if (setpgid(0, pgid) == -1)
+                {
+                    if (errno != EACCES &&
+                        errno != ESRCH)
+                    {
+                        perror("setpgid");
+                    }
+                }
             }
 
-            args[pipeline->commands[i].argc] = NULL;
 
-            /* Read from previous command */
+            /* Input from previous pipe. */
             if (i > 0)
             {
-                dup2(pipes[i - 1][0], STDIN_FILENO);
-            }
-            else if (pipeline->commands[i].background &&
-                     pipeline->commands[i].input[0] == '\0')
-            {
-                int fd = open("/dev/null", O_RDONLY);
-
-                if (fd >= 0)
+                if (dup2(pipes[i - 1][0],
+                         STDIN_FILENO) == -1)
                 {
-                    dup2(fd, STDIN_FILENO);
-                    close(fd);
+                    perror("dup2");
+                    exit(EXIT_FAILURE);
                 }
             }
 
-            /* Write to next command */
+
+            /* Output to next pipe. */
             if (i < pipeline->command_count - 1)
             {
-                dup2(pipes[i][1], STDOUT_FILENO);
+                if (dup2(pipes[i][1],
+                         STDOUT_FILENO) == -1)
+                {
+                    perror("dup2");
+                    exit(EXIT_FAILURE);
+                }
             }
 
-            /* Output redirection on final command */
-            if (i == pipeline->command_count - 1 &&
-                pipeline->commands[i].output[0] != '\0')
-            {
-                int fd;
 
-                if (pipeline->commands[i].append)
-                {
-                    fd = open(pipeline->commands[i].output,
-                              O_WRONLY | O_CREAT | O_APPEND,
-                              0644);
-                }
-                else
-                {
-                    fd = open(pipeline->commands[i].output,
-                              O_WRONLY | O_CREAT | O_TRUNC,
-                              0644);
-                }
+            /*
+             * Background pipeline:
+             * first command reads from /dev/null.
+             */
+            if (background && i == 0)
+            {
+                fd = open("/dev/null", O_RDONLY);
 
                 if (fd < 0)
                 {
-                    perror("output");
+                    perror("/dev/null");
+                    exit(EXIT_FAILURE);
+                }
+
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
+
+
+            /* Input redirection. */
+            if (pipeline->commands[i].input[0] != '\0')
+            {
+                fd = open(
+                    pipeline->commands[i].input,
+                    O_RDONLY);
+
+                if (fd < 0)
+                {
+                    perror("open input");
+                    exit(EXIT_FAILURE);
+                }
+
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
+
+
+            /* Output redirection. */
+            if (pipeline->commands[i].output[0] != '\0')
+            {
+                int flags = O_WRONLY | O_CREAT;
+
+                if (pipeline->commands[i].append)
+                    flags |= O_APPEND;
+                else
+                    flags |= O_TRUNC;
+
+                fd = open(
+                    pipeline->commands[i].output,
+                    flags,
+                    0644);
+
+                if (fd < 0)
+                {
+                    perror("open output");
                     exit(EXIT_FAILURE);
                 }
 
@@ -272,7 +602,8 @@ int execute_pipeline(pipeline_t *pipeline)
                 close(fd);
             }
 
-            /* Close all pipe descriptors */
+
+            /* Close all pipe descriptors. */
             for (j = 0;
                  j < pipeline->command_count - 1;
                  j++)
@@ -281,38 +612,154 @@ int execute_pipeline(pipeline_t *pipeline)
                 close(pipes[j][1]);
             }
 
-            execvp(args[0], args);
 
-            perror("Shellforge");
+            /* Builtin inside pipeline. */
+            if (is_builtin(
+                    &pipeline->commands[i]))
+            {
+                exit(execute_builtin(
+                    &pipeline->commands[i]));
+            }
+
+
+            /* External command. */
+            execvp(
+                pipeline->commands[i].argv[0],
+                pipeline->commands[i].argv);
+
+            perror(
+                pipeline->commands[i].argv[0]);
+
             exit(EXIT_FAILURE);
+        }
+
+
+        /* -------------------------------------------------
+           Parent
+           ------------------------------------------------- */
+
+        
+
+        if (i == 0)
+        {
+            pgid = pid;
+        }
+
+        if (setpgid(pid, pgid) == -1)
+        {
+            if (errno != EACCES &&
+                errno != ESRCH)
+            {
+                perror("setpgid");
+            }
         }
     }
 
-    /* Parent closes all pipes */
-    for (i = 0; i < pipeline->command_count - 1; i++)
+
+    /* -----------------------------------------------------
+       Parent closes all pipes
+       ----------------------------------------------------- */
+
+    for (i = 0;
+         i < pipeline->command_count - 1;
+         i++)
     {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
 
-    /*
-     * If the pipeline is running in background,
-     * do not wait for the children.
-     */
-    if (pipeline->commands[
-            pipeline->command_count - 1].background)
+
+    /* -----------------------------------------------------
+       Background pipeline
+       ----------------------------------------------------- */
+
+    if (background)
     {
-        printf("[Background pipeline started: %d]\n",
-               pids[0]);
+        int job_id;
+
+        job_id = job_add(
+            pgid,
+            command_text,
+            JOB_RUNNING);
+
+        if (job_id > 0)
+        {
+            printf("[%d] Running %s\n",
+                   job_id,
+                   command_text);
+        }
 
         return 0;
     }
 
-    /* Foreground pipeline */
-    for (i = 0; i < pipeline->command_count; i++)
+
+    /* -----------------------------------------------------
+       Foreground pipeline
+       ----------------------------------------------------- */
+
+    give_terminal_to(pgid);
+
+    while (1)
     {
-        waitpid(pids[i], &status, 0);
+        pid_t result;
+
+        result = waitpid(-pgid,
+                         &status,
+                         WUNTRACED);
+
+        if (result == -1)
+        {
+            if (errno == EINTR)
+                continue;
+
+            if (errno == ECHILD)
+                break;
+
+            perror("waitpid");
+            break;
+        }
+
+        /*
+         * If one process in the pipeline is stopped,
+         * the whole pipeline becomes a stopped job.
+         */
+        if (WIFSTOPPED(status))
+        {
+            int job_id;
+
+            /*
+             * Stop the complete process group.
+             */
+            kill(-pgid, SIGSTOP);
+
+            job_id = job_add(
+                pgid,
+                command_text,
+                JOB_STOPPED);
+
+            if (job_id > 0)
+            {
+                printf("\n[%d] Stopped %s\n",
+                       job_id,
+                       command_text);
+            }
+
+            take_terminal_back();
+
+            return 0;
+        }
+
+        /*
+         * Continue waiting until all children are gone.
+         */
+        if (WIFEXITED(status) ||
+            WIFSIGNALED(status))
+        {
+            continue;
+        }
     }
+
+    take_terminal_back();
 
     return 0;
 }
